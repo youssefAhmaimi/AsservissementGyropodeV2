@@ -6,269 +6,238 @@
 #include <math.h>
 #include <ESP32Encoder.h>
 
-#define RayonRoue 0.0325 // Rayon de la roue en m
+#define RayonRoue 0.0325                                                        // Rayon de la roue en m
 
-// --- Déclaration des broches moteurs ---
-unsigned char PWMGplus = 17;                                                              // PWM moteur gauche (sens +)
-unsigned char PWMDplus = 16;                                                              // PWM moteur droit  (sens +)
+// --- Configuration des broches moteurs ---
+unsigned char PWMGplus = 17;                                                    // PWM moteur gauche (sens +)
+unsigned char PWMDplus = 16;                                                    // PWM moteur droit  (sens +)
+unsigned char PWMGmoins = 4;                                                    // PWM moteur gauche (sens -)
+unsigned char PWMDmoins = 19;                                                   // PWM moteur droit  (sens -)
+char Batterie = 25;                                                             // Mesure tension batterie
 
-unsigned char PWMGmoins = 4;                                                              // PWM moteur gauche (sens -)
-unsigned char PWMDmoins = 19;                                                             // PWM moteur droit  (sens -)
+// --- Instanciation des objets ---
+BluetoothSerial SerialBT;                                                       // Communication Bluetooth
+Adafruit_MPU6050 mpu;                                                           // Capteur IMU
+ESP32Encoder encoderL;                                                          // Encodeur Gauche
+ESP32Encoder encoderR;                                                          // Encodeur Droit
 
-char Batterie = 25;                                                                       // Broche de mesure batterie
-
-// --- Objets ---
-BluetoothSerial SerialBT;                                                                 // Communication Bluetooth
-Adafruit_MPU6050 mpu;                                                                     // Capteur MPU6050
-
-ESP32Encoder encoderL;
-ESP32Encoder encoderR;
-
-// --- Variables capteurs / filtres ---
-float TetaG, TetaW;                                                                       // Angles bruts
-float TetaWF, TetaGF, Teta;                                                               // Angles filtrés
-char FlagCalcul = 0;                                                                      // Indique fin du calcul
+// --- Variables de filtrage et temps réel ---
+float TetaG, TetaW;                                                             // Angles bruts (Acc / Gyro)
+float TetaWF, TetaGF, Teta;                                                     // Angles filtrés et fusionnés
+char FlagCalcul = 0;                                                            // Flag de synchronisation
 float Ve, Vs = 0;
-float Te = 10;                                                                            // Période d'échantillonnage (ms)
-float Tau = 1000;                                                                         // Constante du filtre (ms)
-float A, B;                                                                               // Coefficients du filtre
+float Te = 10.0;                                                                // Période d'échantillonnage (ms)
+float Tau = 1000.0, TauVitesse = 570.0;                                         // Constantes de temps filtres
+float A, B;                                                                     // Coeffs récurrence filtre
+float AVitesse, BVitesse;
 
-// --- Mesure batterie ---
-float R1 = 22000.0;                                                                       // Résistance 22k
-float R2 = 10000.0;                                                                       // Résistance 10k
+// --- Paramètres pont diviseur batterie ---
+float R1 = 22000.0;                                                             // Résistance 22k
+float R2 = 10000.0;                                                             // Résistance 10k
 float valeurbatterie;
 
-// --- Encodeur ---
+// --- Variables Odométrie ---
 long TetaMG, TetaMD;
 long encodeur_precedentMG = 0, encodeur_presentMG = 0;
 long encodeur_precedentMD = 0, encodeur_presentMD = 0;
-int deltaEncodeurMG, deltaEncodeurMD;
-float VG;
+float deltaEncodeurMG, deltaEncodeurMD, deltaMoyenne;
+float deltaEncodeurMG_Angulaire, deltaEncodeurMD_Angulaire;
+float vitesseLineaire, vitesseLineaireF;
+int TetaMG_par_Tick, TetaMD_par_Tick;
+const float Nb_de_ticks = 748.0;                                                // Résolution par tour
 
-// --- PID ---
-// Position
-float kpPosition = 4.74, kdPosition = 0.08;
+// --- Paramètres des Correcteurs PID ---
+float kpPosition = 3.19, kdPosition = 0.034;                                    // Gains boucle inclinaison
 float erreurTeta;
-float TetaConsigne = 0.0;
-// Vitesse
-float kpVitesse = 0.0, kdVitesse = 0.0, kiVitesse = 0.0;
-float erreurVitesse, deriveVitesse = 0, erreurPrecedentVitesse, integraleVitesse;
+volatile float TetaConsigne = 0.0;
+float kpVitesse = 6.94, kdVitesse = 1.94;                                       // Gains boucle vitesse
+float erreurVitesse, deriveVitesse = 0, erreurPrecedentVitesse = 0;
 float VitesseConsigne = 0.0;
+float Ec, CO1 = 0.166, CO2 = 0.06;                                              // Sortie et compensation frottement
+int dutyCyclePositif, dutyCycleNegatif;
+int offsetplusG, offsetplusD, offsetmoinsG, offsetmoinsD;                       // Offsets de trajectoire
 
-float Ec, CO = 0.0555;                                                                    // Sortie du correcteur
-int dutyCycle1, dutyCycle2;                                                               // PWM moteurs
+// --- Configuration hardware PWM ---
+unsigned int frequence = 20000;                                                 // 20 kHz
+unsigned char MOTGplus = 0;                                                     // Canal PWM G+
+unsigned char MOTDplus = 1;                                                     // Canal PWM D+
+unsigned char MOTGmoins = 2;                                                    // Canal PWM G-
+unsigned char MOTDmoins = 3;                                                    // Canal PWM D-
+unsigned char resolution = 10;                                                  // Résolution 10 bits
 
-// --- PWM ---
-unsigned int frequence = 20000;                                                           // 20 kHz
-unsigned char MOTGplus = 0;                                                               // Canal PWM moteur gauche +
-unsigned char MOTDplus = 1;                                                               // Canal PWM moteur droit  +
-unsigned char MOTGmoins = 2;                                                              // Canal PWM moteur gauche -
-unsigned char MOTDmoins = 3;                                                              // Canal PWM moteur droit  -
-unsigned char resolution = 10;                                                            // Résolution 10 bits (0–1023)
-
-// --- Tâche de contrôle du gyropode ---
+// --- Tâche de contrôle temps réel ---
 void controle(void *parameters)
 {
-  TickType_t xLastWakeTime;                                                               // Temps de réveil FreeRTOS
-  xLastWakeTime = xTaskGetTickCount();                                                    // Initialisation
+  TickType_t xLastWakeTime;
+  xLastWakeTime = xTaskGetTickCount();
 
   while (1)
   {
-    // --- Lecture MPU6050 ---
-    sensors_event_t a, g, temp;                                                           // Objets pour stocker mesures
-    mpu.getEvent(&a, &g, &temp);                                                          // Lecture capteur
+    // Lecture capteur MPU6050
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
 
-    // --- MPU6050 ---
-    // Calcul angle via accéléromètre
-    TetaG = -atan2(a.acceleration.y, a.acceleration.x);                                   // Angle brut
-    TetaGF = A * TetaG + B * TetaGF;                                                      // Filtre passe-bas
+    // Filtrage inclinaison (Accéléromètre)
+    TetaG = -atan2(a.acceleration.y, a.acceleration.x);                         // Calcul angle statique
+    TetaGF = A * TetaG + B * TetaGF;                                            // Passe-bas numérique
 
-    // Calcul angle via gyroscope
-    TetaW = g.gyro.z * Tau / 1000;                                                        // Intégration gyro
-    TetaWF = A * TetaW + B * TetaWF;                                                      // Filtre passe-bas
+    // Traitement Gyroscope
+    TetaW = g.gyro.z * Tau / 1000;                                              // Intégration vitesse angulaire
+    TetaWF = A * TetaW + B * TetaWF;                                            // Filtrage complémentaire
 
-    // Fusion des deux angles
-    Teta = TetaWF + TetaGF;                                                               // Angle final (radians)
+    // Fusion des signaux
+    Teta = TetaWF + TetaGF;                                                     // Estimation angle final
 
-    // --- Asservissement du Gyropode ---
-    // Calcul des variables de Asservissement de Vitesse
-    erreurVitesse = VitesseConsigne - VG;                                                 // Erreur de la Vitesse
-    deriveVitesse = erreurVitesse - erreurPrecedentVitesse;                               // Dérivé du kdVitesse
-    integraleVitesse += erreurVitesse;                                                    // Intégrale du kiVitesse
+    // Lecture des encodeurs
+    TetaMG = encoderL.getCount();
+    TetaMD = encoderR.getCount();
 
-    // Asservissement Vitesse
-    TetaConsigne = kpVitesse * erreurVitesse + kdVitesse * deriveVitesse + kiVitesse * integraleVitesse;
+    // Calcul des vitesses
+    deltaEncodeurMG = ((float)TetaMG - (float)encodeur_precedentMG) / (Te / 1000.0);
+    deltaEncodeurMD = ((float)TetaMD - (float)encodeur_precedentMD) / (Te / 1000.0);
+    deltaEncodeurMG_Angulaire = deltaEncodeurMG * (2.0 * PI / Nb_de_ticks);
+    deltaEncodeurMD_Angulaire = deltaEncodeurMD * (2.0 * PI / Nb_de_ticks);
+    deltaMoyenne = (deltaEncodeurMG_Angulaire + deltaEncodeurMD_Angulaire) / 2.0;
 
-    erreurTeta = TetaConsigne - Teta;                                                     // Erreur de Position
+    vitesseLineaire = deltaMoyenne * RayonRoue;                                 // Vitesse en m/s
+    vitesseLineaireF = AVitesse * vitesseLineaire + BVitesse * vitesseLineaireF;// Filtrage vitesse
 
-    // Asservissement Position
-    Ec = -kpPosition * erreurTeta + kdPosition * g.gyro.z;                                // Sortie du correcteur
+    // Asservissement de Vitesse (Boucle externe)
+    erreurVitesse = VitesseConsigne - vitesseLineaireF;
+    deriveVitesse = erreurVitesse - erreurPrecedentVitesse;
+    erreurPrecedentVitesse = erreurVitesse;
+    TetaConsigne = kpVitesse * erreurVitesse + kdVitesse * deriveVitesse;       // Consigne d'angle générée par le correcteur de vitesse
+    TetaConsigne = constrain(TetaConsigne, -2.0 / 180 * PI, 2.0 / 180 * PI);    // Saturation consigne angle
 
-    if (Ec > 0) Ec += CO;                                                                 // Compensation Force de frottement Sec     
-    if (Ec < 0) Ec -= CO;                                                                 // Compensation Force de frottement Sec
+    // Asservissement de Position/Équilibre (Boucle interne)
+    erreurTeta = TetaConsigne - Teta;
+    Ec = -kpPosition * erreurTeta + kdPosition * g.gyro.z;                      // Commande générée par le correcteur d'inclinaison
 
-    if (Ec > 0.45) Ec = 0.45;                                                             // Saturation à 95% du programme     
+    // Compensation non-linéaire (Frottements)
+    if (Ec > 0) Ec += CO1;
+    if (Ec < 0) Ec -= CO2;
+
+    // Protection et saturation puissance
+    if (Ec > 0.45) Ec = 0.45;
     if (Ec < -0.45) Ec = -0.45;
-      
 
-    // --- Conversion en PWM ---
-    dutyCycle1 = (0.5 + Ec) * 1023;                                                       // PWM sens +
-    dutyCycle2 = (0.5 - Ec) * 1023;                                                       // PWM sens -
+    // Conversion en rapports cycliques
+    dutyCyclePositif = (0.5 + Ec) * 1023;
+    dutyCycleNegatif = (0.5 - Ec) * 1023;
 
-    TetaMG = encoderL.getCount();                                                         // Position Angulaire Moteur Gauche
-    TetaMD = encoderR.getCount();                                                         // Position Angulaire Moteur Droit
+    // Commande moteurs
+    ledcWrite(MOTGplus, dutyCyclePositif + offsetplusG);
+    ledcWrite(MOTDplus, dutyCyclePositif + offsetplusD);
+    ledcWrite(MOTGmoins, dutyCycleNegatif + offsetmoinsG);
+    ledcWrite(MOTDmoins, dutyCycleNegatif + offsetmoinsD);
 
-    deltaEncodeurMG = (TetaMG - encodeur_precedentMG) * 2 * PI / (Te / 1000);             // Vitesse Angulaire Moteur Gauche en (rad/s)
-    deltaEncodeurMD = (TetaMD - encodeur_precedentMD) * 2 * PI / (Te / 1000);             // Vitesse Angulaire Moteur Droit en (rad/s)
+    // Archivage données cycle n-1
+    encodeur_precedentMG = TetaMG;
+    encodeur_precedentMD = TetaMD;
+    valeurbatterie = (((3.3 / 4095.0) * analogRead(Batterie) * (R1 + R2)) / R2) + 0.3;
 
-    VG = (((float)deltaEncodeurMD + (float)deltaEncodeurMG) / 2) * RayonRoue;             // Vitesse Linéaire des Moteurs en (m/s)
-
-    // --- Envoi PWM moteurs ---
-    ledcWrite(MOTGplus, dutyCycle1);                                                      // Moteur gauche +
-    ledcWrite(MOTDplus, dutyCycle1);                                                      // Moteur droit  +
-
-    ledcWrite(MOTGmoins, dutyCycle2);                                                     // Moteur gauche -
-    ledcWrite(MOTDmoins, dutyCycle2);                                                     // Moteur droit  -
-
-    erreurPrecedentVitesse = erreurVitesse;                                               // Memorisation de l'erreur
-
-    encodeur_precedentMG = TetaMG;                                                        // Memorisation TetaMG
-    encodeur_precedentMD = TetaMD;                                                        // Memorisation TetaMD
-
-    // --- Fin du cycle ---
-    FlagCalcul = 1;                                                                       // Indique que les calculs sont faits
-    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(Te));                                   // Attente période
+    // Finalisation cycle
+    FlagCalcul = 1;
+    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(Te));                         // Cadencement strict
   }
 }
-
-/*void Vin(void *parameters)                                                              // Tâche pour la lecture de la tension de la batterie
-{
-  Ve = 1;
-  while (1)
-  {
-    valeurbatterie = (((3.3/4095.0)*analogRead(Batterie)*(R1+R2))/R2) + 0.3;
-    vTaskDelay(pdMS_TO_TICKS(1000));
-  }
-}
-*/
 
 void setup()
 {
   Serial.begin(115200);
+  SerialBT.begin("Gyro_AHM_TOURE");
+  
   encoderL.attachHalfQuad(34, 35);
   encoderR.attachHalfQuad(27, 13);
-  // --- Configuration PWM ---
+
+  // Configuration Timers PWM
   ledcSetup(MOTGplus, frequence, resolution);
   ledcSetup(MOTDplus, frequence, resolution);
-
   ledcSetup(MOTGmoins, frequence, resolution);
   ledcSetup(MOTDmoins, frequence, resolution);
 
-  // --- Assignation des broches ---
   ledcAttachPin(PWMGplus, MOTGplus);
   ledcAttachPin(PWMDplus, MOTDplus);
   ledcAttachPin(PWMGmoins, MOTGmoins);
   ledcAttachPin(PWMDmoins, MOTDmoins);
 
-  // --- Initialisation MPU6050 ---
-  if (!mpu.begin())
-  {
-    Serial.println("Failed to find MPU6050 chip");
-    while (1)
-    {
-      delay(10);
-    }
+  // Initialisation I2C IMU
+  if (!mpu.begin()) {
+    while (1) { delay(10); }
   }
-  Serial.println("MPU6050 Found!");
 
-  // --- Création tâche contrôle ---
-  xTaskCreate(
-      controle,
-      "controle",
-      10000,
-      NULL,
-      10,
-      NULL);
-
-  // --- Calcul coefficients filtre ---
+  // Initialisation des coefficients de filtrage
   A = 1 / (1 + Tau / Te);
   B = Tau / Te * A;
+  AVitesse = 1 / (1 + TauVitesse / Te);
+  BVitesse = TauVitesse / Te * A;
+
+  // Création de la tâche de régulation
+  xTaskCreate(controle, "controle", 10000, NULL, 10, NULL);
 }
 
-// --- Réception commandes série ---
+// --- Système d'interprétation des commandes Bluetooth ---
 void reception(char ch)
 {
-  static int i = 0;
   static String chaine = "";
-  String commande;
-  String valeur;
-  int index, length;
+  if (ch == '*') {
+    int index = chaine.indexOf(' ');
+    String commande = (index == -1) ? chaine : chaine.substring(0, index);
+    String valeur = (index == -1) ? "" : chaine.substring(index + 1);
 
-  if ((ch == 13) or (ch == 10))
-  {
-    index = chaine.indexOf(' ');
-    length = chaine.length();
-
-    if (index == -1)
-    {
-      commande = chaine;
-      valeur = "";
-    }
-    else
-    {
-      commande = chaine.substring(0, index);
-      valeur = chaine.substring(index + 1, length);
+    // Ajustement dynamique des paramètres
+    if (commande == "Tau") { 
+      Tau = valeur.toFloat(); 
+      A = 1 / (1 + Tau / Te); 
+      B = Tau / Te * A; 
     }
 
-    // --- Commandes dynamiques ---
-    if (commande == "Tau")                                                                // Acquisition Valeur du Tau via TermMecatro
-    {
-      Tau = valeur.toFloat();
-      A = 1 / (1 + Tau / Te);
-      B = Tau / Te * A;
+    if (commande == "TauVitesse") { 
+      TauVitesse = valeur.toFloat(); 
+      AVitesse = 1 / (1 + TauVitesse / Te); 
+      BVitesse = TauVitesse / Te * AVitesse; 
     }
-
-    if (commande == "Te")                                                                 // Acquisition Valeur du Te via TermMecatro
-    {
-      Te = valeur.toInt();
-      A = 1 / (1 + Tau / Te);
-      B = Tau / Te * A;
+    if (commande == "Te") { 
+      Te = valeur.toInt(); 
+      A = 1 / (1 + Tau / Te); 
+      B = Tau / Te * A; 
     }
-
-    if (commande == "kpPosition") kpPosition = valeur.toFloat();                          // Acquisition Valeur du kpPosition via TermMecatro
-    if (commande == "kdPosition") kdPosition = valeur.toFloat();                          // Acquisition Valeur du kdPosition via TermMecatro
     
-    if (commande == "kpVitesse") kpVitesse = valeur.toFloat();                            // Acquisition Valeur du kpVitesse via TermMecatro    
-    if (commande == "kdVitesse") kdVitesse = valeur.toFloat();                            // Acquisition Valeur du kdVitesse via TermMecatro  
-    if (commande == "kiVitesse") kiVitesse = valeur.toFloat();                            // Acquisition Valeur du kiVitesse via TermMecatro
-      
-    if (commande == "CO") CO = valeur.toFloat();                                          // Acquisition Valeur du CO via TermMecatro
-      
+    if (commande == "kpPosition") kpPosition = valeur.toFloat();
+    if (commande == "kdPosition") kdPosition = valeur.toFloat();
+    if (commande == "kpVitesse") kpVitesse = valeur.toFloat() / 100;
+    if (commande == "kdVitesse") kdVitesse = valeur.toFloat() / 1000;
+    if (commande == "CO1") CO1 = valeur.toFloat();
+    if (commande == "CO2") CO2 = valeur.toFloat();
+    
+    // Commandes de mouvement
+    if (commande == "Z") VitesseConsigne = 0.009;                               // Avancer
+    if (commande == "S") VitesseConsigne = -0.008;                              // Reculer
+    if (commande == "z" || commande == "s") VitesseConsigne = 0.0;               // Stop
+    if (commande == "L") offsetplusD = 800;                                     // Gauche
+    if (commande == "l") offsetplusD = 0;
+    if (commande == "R") offsetplusG = 800;                                     // Droite
+    if (commande == "r") offsetplusG = 0;
 
     chaine = "";
-  }
-  else
-  {
+  } else {
     chaine += ch;
   }
 }
 
-// --- Boucle principale ---
+// --- Boucle de communication ---
 void loop()
 {
-  if (FlagCalcul == 1)
-  {
-    Serial.printf("%lf %lf %lf \n", Ec, TetaConsigne, erreurTeta);
-
-    FlagCalcul = 0;
+  while (SerialBT.available() > 0) {
+    reception(SerialBT.read());
   }
-}
 
-// --- Lecture série ---
-void serialEvent()
-{
-  while (Serial.available() > 0)
-  {
-    reception(Serial.read());
+  // Télémétrie Bluetooth
+  if (FlagCalcul == 1) {
+    SerialBT.printf("w%f\n*", valeurbatterie);
+    SerialBT.printf("b%f\n*", kpVitesse);
+    SerialBT.printf("p%f\n*", kdVitesse);
+    SerialBT.printf("G%f*", vitesseLineaireF);
+    FlagCalcul = 0;
   }
 }
